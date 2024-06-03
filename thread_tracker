@@ -1,0 +1,193 @@
+""" thread_tracking.py runs the threads intialized in main.py script.
+"""
+from datetime import datetime
+import os
+import threading
+import queue
+import pandas as pd
+import pytz
+import sqlalchemy as sql
+from sqlalchemy import text
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class MyThread(threading.Thread):
+    """ MyThread class takes in 4 arguments, 'thread_function, thread_name,
+    success_queue, and errors_queue'. The run method handles the success and error
+    cases using the success and errors queues.
+    """
+
+    def __init__(self, thread_function, thread_name, success_queue, errors_queue, start_time, schema, table, engine):
+        threading.Thread.__init__(self)
+        self.thread_function = thread_function
+        self.thread_name = thread_name
+        self.success_queue = success_queue
+        self.errors_queue = errors_queue
+        self.start_time = start_time
+        self.table = table
+        self.schema = schema 
+        self.engine = engine
+
+    def run(self):
+        mt_timezone = pytz.timezone('US/Mountain')
+        try:
+            self.thread_function()
+            self.success_queue.put(
+                (self.thread_name, datetime.now(mt_timezone).replace(tzinfo=None)))
+        # At the momment we are catching all general exceptions
+        except Exception as error:  
+            # limits string to first 5000 characters
+            self.errors_queue.put((self.thread_name, str(
+                error)[:5000], datetime.now(mt_timezone).replace(tzinfo=None)))
+        finally:
+            self.successful_threads()
+            self.unsuccessful_threads()
+
+    def successful_threads(self):
+        """ Processes the successful threads by creating a pandas DataFrame
+        and populating it with information from the success list.
+        The DataFrame is then set to the 'df_complete_threads' DataFrame.
+        """
+        if self.success_queue.qsize() > 0:
+            # update database
+            thread_name, end_time = self.success_queue.get()
+            update_table = """
+                UPDATE {}.{}
+                    SET PROCESS_COMPLETED_DATETIME = '{}', PROCESS_STATUS = 'COMPLETE',
+                        COMPLETE_FLAG = 'Y', ISSUE_FLAG = 'N'
+                    WHERE PROCESS_NAME = '{}' and PROCESS_STARTED_DATETIME = '{}'
+                """.format(self.schema, self.table, end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                           thread_name, self.start_time)
+            dev_engine13 = sql.create_engine(self.engine)
+            with dev_engine13.begin() as update:
+                update.execute(text(update_table))
+
+    def unsuccessful_threads(self):
+        """ Processes the unsuccessful threads by updating data loaded into the table
+        when process was started.
+        """
+        if self.errors_queue.qsize() > 0:
+            thread_name, error, end_time = self.errors_queue.get()
+            error = error.replace("'", "")
+            update_table = """
+                UPDATE {}.{}
+                    SET PROCESS_COMPLETED_DATETIME = '{}', PROCESS_STATUS = 'INCOMPLETE',
+                        COMPLETE_FLAG = 'N', ISSUE_FLAG = 'Y', ISSUE_DESC = '{}'
+                    WHERE PROCESS_NAME = '{}' and PROCESS_STARTED_DATETIME = '{}'
+                """.format(self.schema, self, table, end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], error,
+                           thread_name, self.start_time)
+            dev_engine13 = sql.create_engine(self.engine)
+            with dev_engine13.begin() as update:
+                update.execute(text(update_table))
+
+
+class ThreadTracker:
+    """ ThreadTracker class keeps tracks of the success and errors of the threads.
+    The 'run_threads' method takes a list of threads as an argument, where each element
+    of the list is a tuple of 'thread_function' and 'thread_name'. After 'MyThread' runs
+    and populates success and errors queue, which populate the success and errors list.
+    """
+
+    def __init__(self):
+        self.start_time = None
+        self.df_import = pd.DataFrame()
+        self.thread_list_start_update = []
+        self.thread_freq = []
+        # Using a queue ensures thread safety for when multiple
+        # threads attempt to add items to the queue simultaneously
+        self.errors_queue = queue.Queue()
+        self.success_queue = queue.Queue()
+        mt_timezone = pytz.timezone('US/Mountain')
+        # Set the start time of when threads are beginning
+        mt_start_time = datetime.now(mt_timezone).replace(tzinfo=None)
+        self.start_time = mt_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        self.schema = "set_schema_name"
+        self.table = "set_database_name"
+        self.engine = "set_engine_name"
+
+    def run_threads(self, threads_list: list[str]) -> tuple[list, list]:
+        """ Method creates and starts threads, and populates the list of errors and successes
+        during the execution.
+
+        Args:
+            thread_list (list[str]): A list of tuples containnig the parameters for each thread
+        Returns:
+            A tuple containing two lists:
+                - The list of results from all successful threads.
+                - The list of errors encountered during the execution.
+        """
+        for thread in threads_list:
+            self.thread_list_start_update.append(thread[1])
+            self.thread_freq.append(thread[2])
+
+        self.thread_list_started()
+
+        threads = []
+        for thread in threads_list:
+            thread_inst = MyThread(thread[0], thread[1], self.success_queue,
+                                   self.errors_queue, self.start_time)
+            threads.append(thread_inst)
+
+        # imports into database table threads that started
+        for thread in threads:
+            thread.start()
+
+        # join() behaves similar to time.sleep()
+        for thread in threads:
+            thread.join()
+
+    def thread_list_started(self) -> None:
+        """ Updates database table informing that the process has started
+        """
+        df_row_started = self.data_table_types()
+        if len(self.thread_list_start_update) > 0:
+            df_row_started.loc[:,
+                               "PROCESS_NAME"] = self.thread_list_start_update[:]
+            df_row_started.loc[:, "PROCESS_STATUS"] = "STARTED"
+            df_row_started.loc[:, "PROCESS_FREQUENCY"] = self.thread_freq[:]
+            df_row_started.loc[:, "PROCESS_STARTED_DATETIME"] = self.start_time
+            df_row_started.fillna('', inplace=True)
+            # setting the dataframe and executing import when process started
+            self.df_import = df_row_started
+            self.import_dfs()
+
+    def data_table_types(self):
+        """Creates and returns an empty pandas DataFrame with columns representing
+        the data types and field names for the table that will store process information.
+
+        Returns:
+            A pandas DataFrame with the following columns:
+                - PROCESS_NAME: The name of the process that was executed.
+                - PROCESS_FREQUENCY: The frequency with which the process is executed.
+                - PROCESS_STATUS: The status of the process (e.g. running, completed, failed).
+                - PROCESS_STARTED_DATETIME: The date and time when the process was started.
+                - PROCESS_COMPLETED_DATETIME: The date and time when the process was completed.
+                - COMPLETE_FLAG: A flag whether a process completed successfully (Y) or not (N).
+                - ISSUE_FLAG: A flag whether issue occurred during the process (Y) or not (N).
+                - ISSUE_DESC: A description of any issues encountered during the process.
+        """
+        return pd.DataFrame(columns=["PROCESS_NAME", "PROCESS_FREQUENCY", "PROCESS_STATUS",
+                                     "PROCESS_STARTED_DATETIME", "PROCESS_COMPLETED_DATETIME",
+                                     "COMPLETE_FLAG", "ISSUE_FLAG", "ISSUE_DESC"])
+
+    def import_dfs(self):
+        """ Data import into SQL table.
+        """
+        dtype_parameter = {
+            "PROCESS_NAME": sql.types.VARCHAR(50),
+            "PROCESS_FREQUENCY": sql.types.VARCHAR(20),
+            "PROCESS_STATUS": sql.types.VARCHAR(20),
+            "PROCESS_STARTED_DATETIME": sql.types.DateTime(),
+            "PROCESS_COMPLETED_DATETIME": sql.types.DateTime,
+            "COMPLETE_FLAG": sql.types.CHAR(1),
+            "ISSUE_FLAG": sql.types.CHAR(1),
+            "ISSUE_DESC": sql.types.VARCHAR(5000)
+        }
+        schema_name = self.schema 
+        table_name = self.table
+        dev_engine = sql.create_engine(self.engine)
+        self.df_import.to_sql(con=dev_engine, schema=schema_name, name=table_name,
+                              if_exists='append', index=False, dtype=dtype_parameter)
